@@ -73,8 +73,6 @@ class QuantizedGraph {
         const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
     );
 
-    void copy_vectors(const float*);
-
     [[nodiscard]] float* get_vector(PID data_id) {
         return &data_.at(row_offset_ * data_id);
     }
@@ -117,8 +115,6 @@ class QuantizedGraph {
     find_candidates(PID, size_t, std::vector<Candidate<float>>&, HashBasedBooleanSet&, const std::vector<uint32_t>&)
         const;
 
-    void update_qg(PID, const std::vector<Candidate<float>>&);
-
     void update_results(buffer::ResultBuffer&, const float*);
 
     float scan_neighbors(
@@ -141,6 +137,10 @@ class QuantizedGraph {
     [[nodiscard]] auto entry_point() const { return this->entry_point_; }
 
     void set_ep(PID entry) { this->entry_point_ = entry; };
+
+    void copy_vectors(const float*);
+
+    void update_qg(PID, const std::vector<Candidate<float>>&);
 
     void save_index(const char*) const;
 
