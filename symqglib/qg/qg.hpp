@@ -152,6 +152,11 @@ class QuantizedGraph {
     void search(
         const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
     );
+
+    /* batch search: run num_queries searches in parallel using OpenMP */
+    void batch_search(
+        const float* queries, uint32_t num_queries, uint32_t knn, uint32_t* results
+    );
 };
 
 inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t dim)
@@ -360,6 +365,96 @@ inline void QuantizedGraph::update_results(
         }
         if (result_pool.is_full()) {
             break;
+        }
+    }
+}
+
+inline void QuantizedGraph::batch_search(
+    const float* queries, uint32_t num_queries, uint32_t knn, uint32_t* results
+) {
+    size_t ef = search_pool_.capacity();
+#pragma omp parallel
+    {
+        // Thread-local search state
+        buffer::SearchBuffer local_pool(ef);
+        HashBasedBooleanSet local_visited(std::min(num_points_ / 10, ef * ef));
+        std::vector<float> appro_dist(degree_bound_);
+
+#pragma omp for schedule(dynamic)
+        for (uint32_t i = 0; i < num_queries; ++i) {
+            local_pool.clear();
+            local_visited.clear();
+
+            const float* query = queries + i * dimension_;
+            uint32_t* res = results + i * knn;
+
+            // query preparation
+            QGQuery q_obj(query, padded_dim_);
+            q_obj.query_prepare(rotator_, scanner_);
+
+            local_pool.insert(entry_point_, FLT_MAX);
+            buffer::ResultBuffer res_pool(knn);
+
+            while (local_pool.has_next()) {
+                PID cur_node = local_pool.pop();
+                if (local_visited.get(cur_node)) {
+                    continue;
+                }
+                local_visited.set(cur_node);
+
+                const float* cur_data = get_vector(cur_node);
+                float sqr_y = space::l2_sqr(q_obj.query_data(), cur_data, dimension_);
+
+                const auto* packed_code = reinterpret_cast<const uint8_t*>(&cur_data[code_offset_]);
+                const auto* factor = &cur_data[factor_offset_];
+                scanner_.scan_neighbors(
+                    appro_dist.data(),
+                    q_obj.lut().data(),
+                    sqr_y,
+                    q_obj.lower_val(),
+                    q_obj.width(),
+                    q_obj.sumq(),
+                    packed_code,
+                    factor
+                );
+
+                const PID* ptr_nb = reinterpret_cast<const PID*>(&cur_data[neighbor_offset_]);
+                for (uint32_t j = 0; j < degree_bound_; ++j) {
+                    PID cur_neighbor = ptr_nb[j];
+                    float tmp_dist = appro_dist[j];
+                    if (local_pool.is_full(tmp_dist) || local_visited.get(cur_neighbor)) {
+                        continue;
+                    }
+                    local_pool.insert(cur_neighbor, tmp_dist);
+                    memory::mem_prefetch_l2(
+                        reinterpret_cast<const char*>(get_vector(local_pool.next_id())), 10
+                    );
+                }
+
+                res_pool.insert(cur_node, sqr_y);
+            }
+
+            // update_results inline - recompute exact distances for unfilled results
+            if (!res_pool.is_full()) {
+                auto ids = res_pool.ids();
+                for (PID data_id : ids) {
+                    const PID* ptr_nb = get_neighbors(data_id);
+                    for (uint32_t j = 0; j < degree_bound_; ++j) {
+                        PID cur_neighbor = ptr_nb[j];
+                        if (!local_visited.get(cur_neighbor)) {
+                            local_visited.set(cur_neighbor);
+                            res_pool.insert(
+                                cur_neighbor, space::l2_sqr(query, get_vector(cur_neighbor), dimension_)
+                            );
+                        }
+                    }
+                    if (res_pool.is_full()) {
+                        break;
+                    }
+                }
+            }
+
+            res_pool.copy_results(res);
         }
     }
 }

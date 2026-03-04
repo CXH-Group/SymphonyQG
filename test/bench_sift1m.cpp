@@ -59,9 +59,9 @@ static float compute_recall(
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 5) {
+    if (argc < 6) {
         std::cerr << "Usage: " << argv[0]
-                  << " <base.fvecs> <query.fvecs> <groundtruth.ivecs> <graph.bin>\n";
+                  << " <base.fvecs> <query.fvecs> <groundtruth.ivecs> <graph.bin> <ef_search>\n";
         return 1;
     }
 
@@ -69,9 +69,10 @@ int main(int argc, char* argv[]) {
     std::string query_file = argv[2];
     std::string gt_file = argv[3];
     std::string graph_file = argv[4];
+    size_t ef_search = std::stoul(argv[5]);
 
     uint32_t topk = 100;
-    std::vector<size_t> ef_search_list = {100, 200, 400, 800};
+    std::vector<size_t> ef_search_list = {ef_search};
 
     // --- Load data ---
     std::cout << "=== Loading Data ===" << std::endl;
@@ -106,8 +107,14 @@ int main(int argc, char* argv[]) {
     qg.copy_vectors(base.data());
     std::cout << "Vectors copied" << std::endl;
 
-    // Use vertex 0 as entry point (skip expensive centroid computation)
-    qg.set_ep(0);
+    // Compute centroid, find nearest real vertex, use as entry point
+    int num_threads = omp_get_max_threads();
+    std::vector<float> centroid =
+        symqg::space::compute_centroid(base.data(), num_base, dim, num_threads);
+    symqg::PID entry_point = symqg::space::exact_nn(
+        base.data(), centroid.data(), num_base, dim, num_threads, symqg::space::l2_sqr);
+    qg.set_ep(entry_point);
+    std::cout << "Entry point: " << entry_point << std::endl;
 
     // Compute quantization codes
     #pragma omp parallel for schedule(dynamic)
@@ -126,7 +133,8 @@ int main(int argc, char* argv[]) {
               << build_secs << " seconds" << std::endl;
 
     // --- Benchmark queries ---
-    std::cout << "\n=== Benchmarking Queries (top-" << topk << ") ===" << std::endl;
+    std::cout << "\n=== Benchmarking Queries (top-" << topk
+              << ", threads=" << num_threads << ") ===" << std::endl;
     std::cout << std::setw(8) << "EF"
               << std::setw(14) << "Recall@" + std::to_string(topk) + "(%)"
               << std::setw(14) << "QPS"
@@ -137,18 +145,21 @@ int main(int argc, char* argv[]) {
     for (size_t ef : ef_search_list) {
         qg.set_ef(ef);
 
-        std::vector<std::vector<uint32_t>> all_results(num_queries);
-        for (auto& v : all_results) {
-            v.resize(topk);
-        }
+        std::vector<uint32_t> all_results(num_queries * topk);
 
         StopW query_timer;
-        for (size_t i = 0; i < num_queries; ++i) {
-            qg.search(&queries(static_cast<long>(i), 0), topk, all_results[i].data());
-        }
+        qg.batch_search(queries.data(), static_cast<uint32_t>(num_queries), topk, all_results.data());
         float elapsed_ms = query_timer.get_elapsed_mili();
 
-        float recall = compute_recall(all_results, groundtruth, topk);
+        // Convert flat results to nested for recall computation
+        std::vector<std::vector<uint32_t>> results_nested(num_queries);
+        for (size_t i = 0; i < num_queries; ++i) {
+            results_nested[i].assign(
+                all_results.data() + i * topk,
+                all_results.data() + (i + 1) * topk);
+        }
+
+        float recall = compute_recall(results_nested, groundtruth, topk);
         float qps = static_cast<float>(num_queries) / (elapsed_ms / 1000.0F);
         float avg_latency_us = (elapsed_ms * 1000.0F) / static_cast<float>(num_queries);
 
